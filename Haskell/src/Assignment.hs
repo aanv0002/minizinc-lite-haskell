@@ -17,7 +17,7 @@ import Data.Maybe (listToMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 
 import Instances (ParseError (UnexpectedString), Parser)
-import Parser (charTok, eof, int, satisfy, spaces, stringTok, tok)
+import Parser (charTok, eof, int, satisfy, spaces, stringTok, tok, is, failed)
 
 --------------------------------------------------------------------------------
 -- AST
@@ -67,7 +67,7 @@ miniZincParser = do
     _ <- charTok ';'
     _ <- spaces
     _ <- eof
-    pure (ADT [] [] Satisfy)
+    pure (ADT decls [] Satisfy)
 
 -- Parse an identifier starting with a letter, followed by letters, digits or underscores
 identifierParser :: Parser String
@@ -79,15 +79,24 @@ identifierParser = do
   where
     isIdentifierChar c = isAlphaNum c || c == '_'
 
+-- Parse positive and negative integer literals.
+-- The minus sign is optional, and whitespace after the integer is ignored.
+signedIntParser :: Parser Int
+signedIntParser = tok $
+    (negate <$> (is '-' *> int))
+        <|> int
 
 -- Parse an inclusive integer range.
--- This initial version supports non-negative bounds.
+-- Reject ranges whose lower bound exceeds their upper bound.
 domainParser :: Parser Domain
 domainParser = do
-    lower <- tok int
+    lower <- signedIntParser
     _ <- stringTok ".."
-    upper <- tok int
-    pure (Range lower upper)
+    upper <- signedIntParser
+
+    if lower <= upper
+        then pure (Range lower upper)
+        else failed (UnexpectedString "Invalid range")
 
 -- Parse a variable declaration.
 variableDeclarationParser :: Parser Declaration

@@ -52,7 +52,13 @@ data Expr
     | Neg Expr
     deriving (Eq, Show)
 
-data CompareOperator = OpEq
+data CompareOperator
+    = OpEq
+    | OpNe
+    | OpLt
+    | OpLe
+    | OpGt
+    | OpGe
     deriving (Eq, Show)
 
 data Constraint = Compare CompareOperator Expr Expr
@@ -65,16 +71,38 @@ data SolverGoal = Satisfy
 -- Parser
 --------------------------------------------------------------------------------
 
+-- Parse one of the six comparison operators.
+compareOperatorParser :: Parser CompareOperator
+compareOperatorParser =
+        (OpNe <$ stringTok "!=")
+    <|> (OpLe <$ stringTok "<=")
+    <|> (OpGe <$ stringTok ">=")
+    <|> (OpEq <$ stringTok "=")
+    <|> (OpLt <$ stringTok "<")
+    <|> (OpGt <$ stringTok ">")
+
+-- Parse a constraint comparing two arithmetic expressions.
+constraintParser :: Parser Constraint
+constraintParser = do
+    _ <- stringTok "constraint"
+    left <- exprParser
+    operator <- compareOperatorParser
+    right <- exprParser
+    _ <- charTok ';'
+    pure (Compare operator left right)
+
+-- Parse declarations, constraints and a solve directive.
 miniZincParser :: Parser ADT
 miniZincParser = do
     _ <- spaces
     decls <- many declarationParser
+    cons <- many constraintParser
     _ <- stringTok "solve"
     _ <- stringTok "satisfy"
     _ <- charTok ';'
     _ <- spaces
     _ <- eof
-    pure (ADT decls [] Satisfy)
+    pure (ADT decls cons Satisfy)
 
 -- Parse an identifier starting with a letter, followed by letters, digits or underscores
 identifierParser :: Parser String
@@ -229,25 +257,81 @@ solveProblem adt = listToMaybe (search problem)
             , searchConstraints = constraints adt
             }
 
+-- Collect identifiers referenced by an expression.
+exprIdentifiers :: Expr -> [Identifier]
+exprIdentifiers (IntLit _) = []
+exprIdentifiers (Var name) = [name]
+exprIdentifiers (Neg a) = exprIdentifiers a
+exprIdentifiers (Add a b) = binaryIdentifiers a b
+exprIdentifiers (Sub a b) = binaryIdentifiers a b
+exprIdentifiers (Mul a b) = binaryIdentifiers a b
+exprIdentifiers (Div a b) = binaryIdentifiers a b
+exprIdentifiers (Pow a b) = binaryIdentifiers a b
+
+-- Collect identifiers from two expressions.
+binaryIdentifiers :: Expr -> Expr -> [Identifier]
+binaryIdentifiers a b =
+    exprIdentifiers a ++ exprIdentifiers b
+
+-- Collect identifiers referenced by a constraint.
+constraintIdentifiers :: Constraint -> [Identifier]
+constraintIdentifiers (Compare _ a b) =
+    binaryIdentifiers a b
+
+-- | Determine whether all identifiers have values.
+constraintReady :: ConstraintProblem -> Constraint -> Bool
+constraintReady p c =
+    all isBound (constraintIdentifiers c)
+  where
+    bindings = searchConstants p ++ solvedVars p
+
+    isBound name =
+        name `elem` map fst bindings
+
+-- Reject constraints that are already known to be false.
+-- Constraints with missing variables are checked later.
+consistent :: ConstraintProblem -> Bool
+consistent p = all valid (searchConstraints p)
+  where
+    valid c
+        | constraintReady p c =
+            evalConstraint p c == Just True
+        | otherwise = True
+
+-- Search variable assignments using incremental backtracking.
 search :: ConstraintProblem -> [[Binding]]
-search p = case remainingDeclarations p of
-    [] -> if allSatisfied p then [reverse (solvedVars p)] else []
-    ConstantDeclaration name e : rest ->
-        case evalExpr p e of
-            Nothing -> []
-            Just v ->
-                search
-                    p
-                        { remainingDeclarations = rest
-                        , searchConstants = (name, v) : searchConstants p
-                        }
-    VariableDeclaration name dom : rest -> do
-        v <- domainValues p dom
-        search
-            p
-                { remainingDeclarations = rest
-                , solvedVars = (name, v) : solvedVars p
-                }
+search p =
+    case remainingDeclarations p of
+        [] ->
+            if allSatisfied p
+                then [reverse (solvedVars p)]
+                else []
+
+        ConstantDeclaration name e : rest ->
+            case evalExpr p e of
+                Nothing -> []
+                Just value ->
+                    let next = p
+                            { remainingDeclarations = rest
+                            , searchConstants =
+                                (name, value) : searchConstants p
+                            }
+                    in if consistent next
+                        then search next
+                        else []
+
+        VariableDeclaration name dom : rest -> do
+            value <- domainValues p dom
+
+            let next = p
+                    { remainingDeclarations = rest
+                    , solvedVars =
+                        (name, value) : solvedVars p
+                    }
+
+            if consistent next
+                then search next
+                else []
 
 -- Generate possible values for a variable domain.
 domainValues :: ConstraintProblem -> Domain -> [Int]
@@ -292,8 +376,14 @@ evalExpr p (Neg a) =
 evalConstraint :: ConstraintProblem -> Constraint -> Maybe Bool
 evalConstraint p (Compare op a b) = applyCompare op <$> evalExpr p a <*> evalExpr p b
 
+-- Evaluate a comparison between two integer values.
 applyCompare :: CompareOperator -> Int -> Int -> Bool
 applyCompare OpEq = (==)
+applyCompare OpNe = (/=)
+applyCompare OpLt = (<)
+applyCompare OpLe = (<=)
+applyCompare OpGt = (>)
+applyCompare OpGe = (>=)
 
 allSatisfied :: ConstraintProblem -> Bool
 allSatisfied p = all ((== Just True) . evalConstraint p) (searchConstraints p)

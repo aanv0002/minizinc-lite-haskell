@@ -17,11 +17,14 @@ const modelInput = document.getElementById(
 
 const runButton = document.getElementById("run-model")!;
 
+const saveButton = document.getElementById("save-solution")!;
+
 const outputEl = document.getElementById("model-output") as HTMLOutputElement;
 
 const initialState: State = {
     model: "",
     run: false,
+    save: false,
 };
 
 const initialOutput: Output = {
@@ -38,22 +41,34 @@ const modelInput$: Observable<Action<State>> = fromEvent(
         ...state,
         model: value,
         run: false,
+        save: false,
     })),
 );
 
-const run$: Observable<Action<State>> = fromEvent(runButton, "click").pipe(
-    map(() => state => ({
-        ...state,
-        run: true,
-    })),
-);
+const run$: Observable<Action<State>> =
+    fromEvent(runButton, "click").pipe(
+        map(() => state => ({
+            ...state,
+            run: true,
+            save: false,
+        })),
+    );
+
+const save$: Observable<Action<State>> =
+    fromEvent(saveButton, "click").pipe(
+        map(() => state => ({
+            ...state,
+            run: false,
+            save: true,
+        })),
+    );
 
 function getOutput(state: State): Observable<Action<Output>> {
     const body = new URLSearchParams();
     body.set("model", state.model);
 
     return fromFetch<Readonly<{ result: string } | { error: string }>>(
-        "/api/minizinc",
+        state.save ? "/api/save" : "/api/minizinc",
         {
             method: "POST",
             headers: {
@@ -73,14 +88,15 @@ function getOutput(state: State): Observable<Action<Output>> {
 }
 
 function main() {
-    const state$ = merge(modelInput$, run$).pipe(
+    const state$ = merge(modelInput$, run$, save$).pipe(
         scan((state, action) => action(state), initialState),
         startWith(initialState),
     );
+
     state$.subscribe(console.log);
 
     const output$ = state$.pipe(
-        filter(state => state.run),
+        filter(state => state.run || state.save),
         switchMap(getOutput),
         scan((output, action) => action(output), initialOutput),
         startWith(initialOutput),

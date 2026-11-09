@@ -11,13 +11,13 @@ module Assignment
     , getTime
     ) where
 
-import Control.Applicative (many, some, (<|>))
+import Control.Applicative (many, (<|>))
 import Data.Char (isAlpha, isAlphaNum)
 import Data.Maybe (listToMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 
 import Instances (ParseError (UnexpectedString), Parser)
-import Parser (charTok, eof, int, satisfy, spaces, stringTok, tok, is, failed)
+import Parser (charTok, eof, int, satisfy, spaces, stringTok, tok, is, failed, sepBy, commaTok)
 
 --------------------------------------------------------------------------------
 -- AST
@@ -38,6 +38,7 @@ data Declaration
     deriving (Eq, Show)
 
 data Domain = Range Int Int
+    | FiniteSet [Int]
     deriving (Eq, Show)
 
 data Expr
@@ -86,10 +87,28 @@ signedIntParser = tok $
     (negate <$> (is '-' *> int))
         <|> int
 
+-- Parse a finite set of integer literals.
+-- Reject duplicate values within the set.
+finiteSetParser :: Parser Domain
+finiteSetParser = do
+    _ <- charTok '{'
+    values <- signedIntParser `sepBy` commaTok
+    _ <- charTok '}'
+
+    if length values == length (unique values)
+        then pure (FiniteSet values)
+        else failed (UnexpectedString "Duplicate set values")
+  where
+    unique :: Eq a => [a] -> [a]
+    unique [] = []
+    unique (x:xs)
+        | x `elem` xs = unique xs
+        | otherwise = x : unique xs
+
 -- Parse an inclusive integer range.
 -- Reject ranges whose lower bound exceeds their upper bound.
-domainParser :: Parser Domain
-domainParser = do
+rangeParser :: Parser Domain
+rangeParser = do
     lower <- signedIntParser
     _ <- stringTok ".."
     upper <- signedIntParser
@@ -97,6 +116,10 @@ domainParser = do
     if lower <= upper
         then pure (Range lower upper)
         else failed (UnexpectedString "Invalid range")
+
+-- Parse either a finite set or an integer range
+domainParser :: Parser Domain
+domainParser = finiteSetParser <|> rangeParser
 
 -- Parse a variable declaration.
 variableDeclarationParser :: Parser Declaration
@@ -152,11 +175,13 @@ search p = case remainingDeclarations p of
                 , solvedVars = (name, v) : solvedVars p
                 }
 
+-- Generate possible values for a variable domain.
 domainValues :: ConstraintProblem -> Domain -> [Int]
-domainValues p (Range lo hi) = [lo..hi]
+domainValues _ (Range lo hi) = [lo..hi]
+domainValues _ (FiniteSet values) = values
 
 evalExpr :: ConstraintProblem -> Expr -> Maybe Int
-evalExpr p (IntLit n) = Just n
+evalExpr _ (IntLit n) = Just n
 evalExpr p (Var x) = lookup x (searchConstants p) <|> lookup x (solvedVars p)
 
 evalConstraint :: ConstraintProblem -> Constraint -> Maybe Bool

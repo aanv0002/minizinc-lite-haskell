@@ -110,17 +110,25 @@ constraintParser = do
     _ <- charTok ';'
     pure result
 
--- Parse declarations, constraints, and one solve directive.
+-- Parse declarations, constraints and one solve goal.
+-- Reject models containing undefined references.
 miniZincParser :: Parser ADT
 miniZincParser = do
     _ <- spaces
-    decls <- many declarationParser
+
+    decls <- declarationsParser [] []
     cons <- many constraintParser
     goal <- solveDirectiveParser
+
     _ <- spaces
     _ <- eof
 
-    pure (ADT decls cons goal)
+    let model = ADT decls cons goal
+
+    if validReferences model
+        then pure model
+        else failed (UnexpectedString
+            "Undefined identifier in model")
 
 -- Parse an identifier starting with a letter, followed by letters, digits or underscores
 identifierParser :: Parser String
@@ -208,30 +216,53 @@ finiteSetParser = do
         | x `elem` xs = unique xs
         | otherwise = x : unique xs
 
--- Parse an inclusive integer range.
--- Reject ranges whose lower bound exceeds their upper bound.
-rangeParser :: Parser Domain
-rangeParser = do
-    lower <- signedIntParser
+-- Parse a literal or a previously defined constant
+-- used as a range boundary.
+rangeBoundParser :: [Binding] -> Parser Int
+rangeBoundParser constants =
+        negativeConstant
+    <|> signedIntParser
+    <|> constantReference
+  where
+    constantReference = do
+        name <- identifierParser
+        case lookup name constants of
+            Just value -> pure value
+            Nothing ->
+                failed (UnexpectedString
+                    ("Undefined constant: " ++ name))
+
+    negativeConstant = do
+        _ <- charTok '-'
+        negate <$> constantReference
+
+-- Parse a valid inclusive range using known constants.
+rangeParserWith :: [Binding] -> Parser Domain
+rangeParserWith constants = do
+    lower <- rangeBoundParser constants
     _ <- stringTok ".."
-    upper <- signedIntParser
+    upper <- rangeBoundParser constants
 
     if lower <= upper
         then pure (Range lower upper)
         else failed (UnexpectedString "Invalid range")
 
--- Parse either a finite set or an integer range
-domainParser :: Parser Domain
-domainParser = finiteSetParser <|> rangeParser
+-- Parse a finite set or constant-aware integer range.
+domainParserWith :: [Binding] -> Parser Domain
+domainParserWith constants =
+    finiteSetParser <|> rangeParserWith constants
 
--- Parse a variable declaration.
-variableDeclarationParser :: Parser Declaration
-variableDeclarationParser = do
+-- Parse variable declarations using previously
+-- evaluated constants for domain boundaries.
+variableDeclarationParserWith
+    :: [Binding] -> Parser Declaration
+variableDeclarationParserWith constants = do
     _ <- stringTok "var"
-    domain <- domainParser
+    domain <- domainParserWith constants
     _ <- charTok ':'
     name <- identifierParser
     _ <- charTok ';'
+
     pure (VariableDeclaration name domain)
 
 -- Parse an integer constant declaration.
@@ -246,11 +277,81 @@ constantDeclarationParser = do
     _ <- charTok ';'
     pure (ConstantDeclaration name value)
 
--- Parse either a constant or variable declaration.
-declarationParser :: Parser Declaration
-declarationParser =
-    constantDeclarationParser
-        <|> variableDeclarationParser
+-- | Parse a declaration using previously evaluated constants.
+declarationParserWith
+    :: [Binding]
+    -> Parser (Declaration, Maybe Binding)
+declarationParserWith constants =
+    parseConstant <|> parseVariable
+  where
+    parseConstant = do
+        decl <- constantDeclarationParser
+
+        case decl of
+            ConstantDeclaration name expression ->
+                case evaluateConstant constants expression of
+                    Just value ->
+                        pure (decl, Just (name, value))
+
+                    Nothing ->
+                        failed (UnexpectedString
+                            ("Invalid constant: " ++ name))
+
+            _ ->
+                failed (UnexpectedString
+                    "Expected a constant declaration")
+
+    parseVariable = do
+        decl <- variableDeclarationParserWith constants
+        pure (decl, Nothing)
+
+-- | Parse declarations sequentially while tracking
+-- defined constants and all previously used names.
+declarationsParser
+    :: [Binding]
+    -> [Identifier]
+    -> Parser [Declaration]
+declarationsParser constants usedNames =
+        parseNext
+    <|> pure []
+  where
+    parseNext = do
+        (decl, newConstant) <-
+            declarationParserWith constants
+
+        let name = case decl of
+                ConstantDeclaration n _ -> n
+                VariableDeclaration n _ -> n
+
+        if name `elem` usedNames
+            then failed (UnexpectedString
+                ("Duplicate identifier: " ++ name))
+            else do
+                let updatedConstants =
+                        case newConstant of
+                            Just binding ->
+                                binding : constants
+                            Nothing ->
+                                constants
+
+                rest <- declarationsParser
+                    updatedConstants
+                    (name : usedNames)
+
+                pure (decl : rest)
+
+-- Evaluate a constant using only earlier constants.
+-- Decision variables are intentionally unavailable.
+evaluateConstant :: [Binding] -> Expr -> Maybe Int
+evaluateConstant constants expression =
+    evalExpr problem expression
+  where
+    problem = ConstraintProblem
+        { searchConstants = constants
+        , solvedVars = []
+        , remainingDeclarations = []
+        , searchConstraints = []
+        }
 
 -- Parse satisfaction and optimization directives.
 solveDirectiveParser :: Parser SolverGoal
@@ -444,6 +545,31 @@ constraintIdentifiers (AnyConstraints comparisons) =
 
 constraintIdentifiers (AllDifferent expressions) =
     concatMap exprIdentifiers expressions
+
+-- Extract identifiers from an optimization objective.
+goalIdentifiers :: SolverGoal -> [Identifier]
+goalIdentifiers Satisfy = []
+goalIdentifiers (Minimize expression) =
+    exprIdentifiers expression
+goalIdentifiers (Maximize expression) =
+    exprIdentifiers expression
+
+-- Ensure constraint and objective identifiers
+-- refer to declarations in the parsed model.
+validReferences :: ADT -> Bool
+validReferences model =
+    all (`elem` declaredNames) referencedNames
+  where
+    declaredNames =
+        map declarationName (declarations model)
+
+    referencedNames =
+        concatMap constraintIdentifiers
+            (constraints model)
+        ++ goalIdentifiers (solverGoal model)
+
+    declarationName (ConstantDeclaration name _) = name
+    declarationName (VariableDeclaration name _) = name
 
 -- | Determine whether all identifiers have values.
 constraintReady :: ConstraintProblem -> Constraint -> Bool

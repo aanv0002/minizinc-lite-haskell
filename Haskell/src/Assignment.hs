@@ -15,6 +15,7 @@ import Control.Applicative (many, (<|>))
 import Data.Char (isAlpha, isAlphaNum)
 import Data.Maybe (listToMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
+import Data.List (nub)
 
 import Instances (ParseError (UnexpectedString), Parser)
 import Parser (charTok, eof, int, satisfy, spaces, stringTok, tok, is, failed, sepBy, commaTok)
@@ -41,6 +42,12 @@ data Domain = Range Int Int
     | FiniteSet [Int]
     deriving (Eq, Show)
 
+data NumericMacroName
+    = MacroSum
+    | MacroMin
+    | MacroMax
+    deriving (Eq, Show)
+
 data Expr
     = IntLit Int
     | Var Identifier
@@ -50,6 +57,7 @@ data Expr
     | Div Expr Expr
     | Pow Expr Expr
     | Neg Expr
+    | NumericMacro NumericMacroName [Expr]
     deriving (Eq, Show)
 
 data CompareOperator
@@ -61,7 +69,11 @@ data CompareOperator
     | OpGe
     deriving (Eq, Show)
 
-data Constraint = Compare CompareOperator Expr Expr
+data Constraint
+    = Compare CompareOperator Expr Expr
+    | AllConstraints [Constraint]
+    | AnyConstraints [Constraint]
+    | AllDifferent [Expr]
     deriving (Eq, Show)
 
 -- The objective of a MiniZinc constraint problem.
@@ -85,15 +97,18 @@ compareOperatorParser =
     <|> (OpLt <$ stringTok "<")
     <|> (OpGt <$ stringTok ">")
 
--- Parse a constraint comparing two arithmetic expressions.
+-- Parse a comparison or predefined boolean macro.
 constraintParser :: Parser Constraint
 constraintParser = do
     _ <- stringTok "constraint"
-    left <- exprParser
-    operator <- compareOperatorParser
-    right <- exprParser
+
+    result <-
+            allDifferentParser
+        <|> booleanComparisonMacroParser
+        <|> comparisonParser
+
     _ <- charTok ';'
-    pure (Compare operator left right)
+    pure result
 
 -- Parse declarations, constraints, and one solve directive.
 miniZincParser :: Parser ADT
@@ -160,12 +175,13 @@ powerParser = do
     (Pow base <$> (charTok '^' *> unaryParser))
         <|> pure base
 
--- | Parse literals, identifiers and parenthesized expressions.
+-- Parse literals, identifiers and parenthesized expressions.
 atomParser :: Parser Expr
 atomParser =
-    (charTok '(' *> exprParser <* charTok ')')
-        <|> (IntLit <$> tok int)
-        <|> (Var <$> identifierParser)
+        numericMacroParser
+    <|> (charTok '(' *> exprParser <* charTok ')')
+    <|> (IntLit <$> tok int)
+    <|> (Var <$> identifierParser)
 
 -- Parse positive and negative integer literals.
 -- The minus sign is optional, and whitespace after the integer is ignored.
@@ -248,6 +264,64 @@ solveDirectiveParser = do
 
     _ <- charTok ';'
     pure goal
+
+-- Parse a list of expressions enclosed in brackets.
+expressionListParser :: Parser [Expr]
+expressionListParser =
+    charTok '['
+        *> (exprParser `sepBy` commaTok)
+        <* charTok ']'
+
+-- Parse a numeric macro: sum, min or max.
+numericMacroParser :: Parser Expr
+numericMacroParser = do
+    macro <-
+            (MacroSum <$ stringTok "sum")
+        <|> (MacroMin <$ stringTok "min")
+        <|> (MacroMax <$ stringTok "max")
+
+    _ <- charTok '('
+    values <- expressionListParser
+    _ <- charTok ')'
+
+    pure (NumericMacro macro values)
+
+-- Parse a comparison without the constraint keyword.
+comparisonParser :: Parser Constraint
+comparisonParser = do
+    left <- exprParser
+    op <- compareOperatorParser
+    right <- exprParser
+    pure (Compare op left right)
+
+-- Parse an array of comparison constraints.
+comparisonListParser :: Parser [Constraint]
+comparisonListParser =
+    charTok '['
+        *> (comparisonParser `sepBy` commaTok)
+        <* charTok ']'
+
+-- Parse boolean macros containing comparisons.
+booleanComparisonMacroParser :: Parser Constraint
+booleanComparisonMacroParser = do
+    constructor <-
+            (AllConstraints <$ stringTok "all")
+        <|> (AnyConstraints <$ stringTok "any")
+
+    _ <- charTok '('
+    comparisons <- comparisonListParser
+    _ <- charTok ')'
+
+    pure (constructor comparisons)
+
+-- Parse allDifferent over a list of expressions.
+allDifferentParser :: Parser Constraint
+allDifferentParser = do
+    _ <- stringTok "allDifferent"
+    _ <- charTok '('
+    values <- expressionListParser
+    _ <- charTok ')'
+    pure (AllDifferent values)
 
 --------------------------------------------------------------------------------
 -- Solver
@@ -349,16 +423,27 @@ exprIdentifiers (Sub a b) = binaryIdentifiers a b
 exprIdentifiers (Mul a b) = binaryIdentifiers a b
 exprIdentifiers (Div a b) = binaryIdentifiers a b
 exprIdentifiers (Pow a b) = binaryIdentifiers a b
+exprIdentifiers (NumericMacro _ values) =
+    concatMap exprIdentifiers values
 
 -- Collect identifiers from two expressions.
 binaryIdentifiers :: Expr -> Expr -> [Identifier]
 binaryIdentifiers a b =
     exprIdentifiers a ++ exprIdentifiers b
 
--- Collect identifiers referenced by a constraint.
+-- Collect identifiers used by each constraint form.
 constraintIdentifiers :: Constraint -> [Identifier]
 constraintIdentifiers (Compare _ a b) =
-    binaryIdentifiers a b
+    exprIdentifiers a ++ exprIdentifiers b
+
+constraintIdentifiers (AllConstraints comparisons) =
+    concatMap constraintIdentifiers comparisons
+
+constraintIdentifiers (AnyConstraints comparisons) =
+    concatMap constraintIdentifiers comparisons
+
+constraintIdentifiers (AllDifferent expressions) =
+    concatMap exprIdentifiers expressions
 
 -- | Determine whether all identifiers have values.
 constraintReady :: ConstraintProblem -> Constraint -> Bool
@@ -455,8 +540,31 @@ evalExpr p (Pow a b) = do
 evalExpr p (Neg a) =
     negate <$> evalExpr p a
 
+evalExpr p (NumericMacro macro values) = do
+    numbers <- traverse (evalExpr p) values
+    case macro of
+        MacroSum -> Just (sum numbers)
+        MacroMin ->
+            if null numbers
+                then Nothing
+                else Just (minimum numbers)
+        MacroMax ->
+            if null numbers
+                then Nothing
+                else Just (maximum numbers)
+
 evalConstraint :: ConstraintProblem -> Constraint -> Maybe Bool
 evalConstraint p (Compare op a b) = applyCompare op <$> evalExpr p a <*> evalExpr p b
+
+evalConstraint p (AllConstraints comparisons) =
+    all id <$> traverse (evalConstraint p) comparisons
+
+evalConstraint p (AnyConstraints comparisons) =
+    any id <$> traverse (evalConstraint p) comparisons
+
+evalConstraint p (AllDifferent expressions) = do
+    values <- traverse (evalExpr p) expressions
+    pure (length values == length (nub values))
 
 -- Evaluate a comparison between two integer values.
 applyCompare :: CompareOperator -> Int -> Int -> Bool

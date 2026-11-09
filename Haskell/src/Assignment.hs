@@ -44,6 +44,12 @@ data Domain = Range Int Int
 data Expr
     = IntLit Int
     | Var Identifier
+    | Add Expr Expr
+    | Sub Expr Expr
+    | Mul Expr Expr
+    | Div Expr Expr
+    | Pow Expr Expr
+    | Neg Expr
     deriving (Eq, Show)
 
 data CompareOperator = OpEq
@@ -80,11 +86,54 @@ identifierParser = do
   where
     isIdentifierChar c = isAlphaNum c || c == '_'
 
--- Parse a basic expression containing either an integer literal or an identifier reference.
--- Arithmetic operations will be added separately
+-- | Parse arithmetic expressions in precedence order.
 exprParser :: Parser Expr
-exprParser =
-    (IntLit <$> signedIntParser)
+exprParser = addSubParser
+
+-- | Parse addition and subtraction from left to right.
+addSubParser :: Parser Expr
+addSubParser = do
+    first <- mulDivParser
+    rest <- many $ do
+        op <- (Add <$ charTok '+')
+          <|> (Sub <$ charTok '-')
+        value <- mulDivParser
+        pure (op, value)
+    pure (foldl applyOp first rest)
+
+-- | Parse multiplication and division.
+mulDivParser :: Parser Expr
+mulDivParser = do
+    first <- unaryParser
+    rest <- many $ do
+        op <- (Mul <$ charTok '*')
+          <|> (Div <$ charTok '/')
+        value <- unaryParser
+        pure (op, value)
+    pure (foldl applyOp first rest)
+
+-- | Apply an operator to the accumulated expression.
+applyOp :: Expr -> (Expr -> Expr -> Expr, Expr) -> Expr
+applyOp left (op, right) = op left right
+
+-- | Parse unary negation after exponentiation precedence.
+unaryParser :: Parser Expr
+unaryParser =
+    (Neg <$> (charTok '-' *> unaryParser))
+        <|> powerParser
+
+-- | Parse right-associative exponentiation.
+powerParser :: Parser Expr
+powerParser = do
+    base <- atomParser
+    (Pow base <$> (charTok '^' *> unaryParser))
+        <|> pure base
+
+-- | Parse literals, identifiers and parenthesized expressions.
+atomParser :: Parser Expr
+atomParser =
+    (charTok '(' *> exprParser <* charTok ')')
+        <|> (IntLit <$> tok int)
         <|> (Var <$> identifierParser)
 
 -- Parse positive and negative integer literals.
@@ -205,9 +254,40 @@ domainValues :: ConstraintProblem -> Domain -> [Int]
 domainValues _ (Range lo hi) = [lo..hi]
 domainValues _ (FiniteSet values) = values
 
+-- | Evaluate an expression using the current bindings.
+-- Invalid operations return Nothing instead of crashing.
 evalExpr :: ConstraintProblem -> Expr -> Maybe Int
 evalExpr _ (IntLit n) = Just n
-evalExpr p (Var x) = lookup x (searchConstants p) <|> lookup x (solvedVars p)
+
+evalExpr p (Var x) =
+    lookup x (searchConstants p)
+        <|> lookup x (solvedVars p)
+
+evalExpr p (Add a b) =
+    (+) <$> evalExpr p a <*> evalExpr p b
+
+evalExpr p (Sub a b) =
+    (-) <$> evalExpr p a <*> evalExpr p b
+
+evalExpr p (Mul a b) =
+    (*) <$> evalExpr p a <*> evalExpr p b
+
+evalExpr p (Div a b) = do
+    x <- evalExpr p a
+    y <- evalExpr p b
+    if y == 0
+        then Nothing
+        else Just (x `div` y)
+
+evalExpr p (Pow a b) = do
+    x <- evalExpr p a
+    y <- evalExpr p b
+    if y < 0
+        then Nothing
+        else Just (x ^ y)
+
+evalExpr p (Neg a) =
+    negate <$> evalExpr p a
 
 evalConstraint :: ConstraintProblem -> Constraint -> Maybe Bool
 evalConstraint p (Compare op a b) = applyCompare op <$> evalExpr p a <*> evalExpr p b

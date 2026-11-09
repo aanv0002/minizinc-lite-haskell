@@ -62,7 +62,7 @@ data SolverGoal = Satisfy
 miniZincParser :: Parser ADT
 miniZincParser = do
     _ <- spaces
-    decls <- many variableDeclarationParser
+    decls <- many declarationParser
     _ <- stringTok "solve"
     _ <- stringTok "satisfy"
     _ <- charTok ';'
@@ -79,6 +79,13 @@ identifierParser = do
     pure (first : rest)
   where
     isIdentifierChar c = isAlphaNum c || c == '_'
+
+-- Parse a basic expression containing either an integer literal or an identifier reference.
+-- Arithmetic operations will be added separately
+exprParser :: Parser Expr
+exprParser =
+    (IntLit <$> signedIntParser)
+        <|> (Var <$> identifierParser)
 
 -- Parse positive and negative integer literals.
 -- The minus sign is optional, and whitespace after the integer is ignored.
@@ -130,6 +137,24 @@ variableDeclarationParser = do
     name <- identifierParser
     _ <- charTok ';'
     pure (VariableDeclaration name domain)
+
+-- Parse an integer constant declaration.
+-- Constants can contain integer literals or references to previously declared identifiers
+constantDeclarationParser :: Parser Declaration
+constantDeclarationParser = do
+    _ <- stringTok "int"
+    _ <- charTok ':'
+    name <- identifierParser
+    _ <- charTok '='
+    value <- exprParser
+    _ <- charTok ';'
+    pure (ConstantDeclaration name value)
+
+-- Parse either a constant or variable declaration.
+declarationParser :: Parser Declaration
+declarationParser =
+    constantDeclarationParser
+        <|> variableDeclarationParser
 
 --------------------------------------------------------------------------------
 -- Solver

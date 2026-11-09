@@ -15,7 +15,7 @@ import Control.Applicative (many, (<|>))
 import Data.Char (isAlpha, isAlphaNum)
 import Data.Maybe (listToMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
-import Data.List (nub)
+import Data.List (isPrefixOf, nub)
 
 import Instances (ParseError (UnexpectedString), Parser)
 import Parser (charTok, eof, int, satisfy, spaces, stringTok, tok, is, failed, sepBy, commaTok)
@@ -36,6 +36,7 @@ data ADT = ADT
 data Declaration
     = ConstantDeclaration Identifier Expr
     | VariableDeclaration Identifier Domain
+    | ArrayDeclaration Identifier Int Domain
     deriving (Eq, Show)
 
 data Domain = Range Int Int
@@ -51,6 +52,7 @@ data NumericMacroName
 data Expr
     = IntLit Int
     | Var Identifier
+    | ArrayAt Identifier Expr
     | Add Expr Expr
     | Sub Expr Expr
     | Mul Expr Expr
@@ -183,13 +185,23 @@ powerParser = do
     (Pow base <$> (charTok '^' *> unaryParser))
         <|> pure base
 
--- Parse literals, identifiers and parenthesized expressions.
+-- | Parse literals, numeric macros, indexed variables
+-- and parenthesized expressions.
 atomParser :: Parser Expr
 atomParser =
         numericMacroParser
     <|> (charTok '(' *> exprParser <* charTok ')')
     <|> (IntLit <$> tok int)
-    <|> (Var <$> identifierParser)
+    <|> variableOrArrayParser
+
+-- | Parse an identifier, optionally followed by an index.
+variableOrArrayParser :: Parser Expr
+variableOrArrayParser = do
+    name <- identifierParser
+
+    (ArrayAt name
+        <$> (charTok '[' *> exprParser <* charTok ']'))
+        <|> pure (Var name)
 
 -- Parse positive and negative integer literals.
 -- The minus sign is optional, and whitespace after the integer is ignored.
@@ -265,6 +277,33 @@ variableDeclarationParserWith constants = do
 
     pure (VariableDeclaration name domain)
 
+-- Parse a one-based array declaration.
+-- Array lengths may use previously declared constants.
+arrayDeclarationParserWith
+    :: [Binding] -> Parser Declaration
+arrayDeclarationParserWith constants = do
+    _ <- stringTok "array"
+    _ <- charTok '['
+    _ <- stringTok "1"
+    _ <- stringTok ".."
+
+    lengthValue <- rangeBoundParser constants
+
+    _ <- charTok ']'
+    _ <- stringTok "of"
+    _ <- stringTok "var"
+
+    domain <- domainParserWith constants
+
+    _ <- charTok ':'
+    name <- identifierParser
+    _ <- charTok ';'
+
+    if lengthValue >= 1
+        then pure (ArrayDeclaration name lengthValue domain)
+        else failed (UnexpectedString
+            "Array length must be at least 1")
+
 -- Parse an integer constant declaration.
 -- Constants can contain integer literals or references to previously declared identifiers
 constantDeclarationParser :: Parser Declaration
@@ -277,12 +316,14 @@ constantDeclarationParser = do
     _ <- charTok ';'
     pure (ConstantDeclaration name value)
 
--- | Parse a declaration using previously evaluated constants.
+-- Parse a declaration using previously evaluated constants.
 declarationParserWith
     :: [Binding]
     -> Parser (Declaration, Maybe Binding)
 declarationParserWith constants =
-    parseConstant <|> parseVariable
+        parseConstant
+    <|> parseArray
+    <|> parseVariable
   where
     parseConstant = do
         decl <- constantDeclarationParser
@@ -304,24 +345,29 @@ declarationParserWith constants =
     parseVariable = do
         decl <- variableDeclarationParserWith constants
         pure (decl, Nothing)
+    
+    parseArray = do
+        decl <- arrayDeclarationParserWith constants
+        pure (decl, Nothing)
 
--- | Parse declarations sequentially while tracking
--- defined constants and all previously used names.
+-- | Parse declarations while tracking constants
+-- and preventing duplicate identifiers.
 declarationsParser
     :: [Binding]
     -> [Identifier]
     -> Parser [Declaration]
 declarationsParser constants usedNames =
-        parseNext
-    <|> pure []
+    parseNext <|> pure []
   where
     parseNext = do
         (decl, newConstant) <-
             declarationParserWith constants
 
-        let name = case decl of
-                ConstantDeclaration n _ -> n
-                VariableDeclaration n _ -> n
+        let name =
+                case decl of
+                    ConstantDeclaration n _ -> n
+                    VariableDeclaration n _ -> n
+                    ArrayDeclaration n _ _ -> n
 
         if name `elem` usedNames
             then failed (UnexpectedString
@@ -526,6 +572,8 @@ exprIdentifiers (Div a b) = binaryIdentifiers a b
 exprIdentifiers (Pow a b) = binaryIdentifiers a b
 exprIdentifiers (NumericMacro _ values) =
     concatMap exprIdentifiers values
+exprIdentifiers (ArrayAt name indexExpr) =
+    name : exprIdentifiers indexExpr
 
 -- Collect identifiers from two expressions.
 binaryIdentifiers :: Expr -> Expr -> [Identifier]
@@ -570,8 +618,10 @@ validReferences model =
 
     declarationName (ConstantDeclaration name _) = name
     declarationName (VariableDeclaration name _) = name
+    declarationName (ArrayDeclaration name _ _) = name
 
--- | Determine whether all identifiers have values.
+-- A constraint is ready once every required
+-- scalar variable or complete array is assigned.
 constraintReady :: ConstraintProblem -> Constraint -> Bool
 constraintReady p c =
     all isBound (constraintIdentifiers c)
@@ -580,6 +630,30 @@ constraintReady p c =
 
     isBound name =
         name `elem` map fst bindings
+            || arrayComplete name
+
+    arrayComplete name =
+        let prefix = name ++ "["
+
+            hasElements =
+                any (isPrefixOf prefix . fst) (solvedVars p)
+
+            stillWaiting =
+                any (belongsToArray name)
+                    (remainingDeclarations p)
+
+        in hasElements && not stillWaiting
+
+    belongsToArray name decl =
+        case decl of
+            ArrayDeclaration arrayName _ _ ->
+                arrayName == name
+
+            VariableDeclaration variableName _ ->
+                isPrefixOf (name ++ "[") variableName
+
+            ConstantDeclaration _ _ ->
+                False
 
 -- Reject constraints that are already known to be false.
 -- Constraints with missing variables are checked later.
@@ -625,6 +699,20 @@ search p =
             if consistent next
                 then search next
                 else []
+
+        ArrayDeclaration name count domain : rest ->
+            let elements =
+                    [ VariableDeclaration
+                        (name ++ "[" ++ show i ++ "]")
+                        domain
+                    | i <- [1..count]
+                    ]
+
+                next = p
+                    { remainingDeclarations = elements ++ rest
+                    }
+
+            in search next
 
 -- Generate possible values for a variable domain.
 domainValues :: ConstraintProblem -> Domain -> [Int]
@@ -678,6 +766,14 @@ evalExpr p (NumericMacro macro values) = do
             if null numbers
                 then Nothing
                 else Just (maximum numbers)
+
+evalExpr p (ArrayAt name indexExpr) = do
+    index <- evalExpr p indexExpr
+
+    let elementName =
+            name ++ "[" ++ show index ++ "]"
+
+    lookup elementName (solvedVars p)
 
 evalConstraint :: ConstraintProblem -> Constraint -> Maybe Bool
 evalConstraint p (Compare op a b) = applyCompare op <$> evalExpr p a <*> evalExpr p b

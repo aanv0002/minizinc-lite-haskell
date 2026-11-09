@@ -16,7 +16,7 @@ import Data.Maybe (listToMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 
 import Instances (ParseError (UnexpectedString), Parser)
-import Parser (failed)
+import Parser (charTok, eof, spaces, stringTok)
 
 --------------------------------------------------------------------------------
 -- AST
@@ -58,7 +58,14 @@ data SolverGoal = Satisfy
 --------------------------------------------------------------------------------
 
 miniZincParser :: Parser ADT
-miniZincParser = failed (UnexpectedString "miniZincParser: not written yet")
+miniZincParser = do
+    _ <- spaces
+    _ <- stringTok "solve"
+    _ <- stringTok "satisfy"
+    _ <- charTok ';'
+    _ <- spaces
+    _ <- eof
+    pure (ADT [] [] Satisfy)
 
 --------------------------------------------------------------------------------
 -- Solver

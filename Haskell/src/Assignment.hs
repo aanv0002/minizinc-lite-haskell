@@ -64,7 +64,11 @@ data CompareOperator
 data Constraint = Compare CompareOperator Expr Expr
     deriving (Eq, Show)
 
-data SolverGoal = Satisfy
+-- The objective of a MiniZinc constraint problem.
+data SolverGoal
+    = Satisfy
+    | Minimize Expr
+    | Maximize Expr
     deriving (Eq, Show)
 
 --------------------------------------------------------------------------------
@@ -91,18 +95,17 @@ constraintParser = do
     _ <- charTok ';'
     pure (Compare operator left right)
 
--- Parse declarations, constraints and a solve directive.
+-- Parse declarations, constraints, and one solve directive.
 miniZincParser :: Parser ADT
 miniZincParser = do
     _ <- spaces
     decls <- many declarationParser
     cons <- many constraintParser
-    _ <- stringTok "solve"
-    _ <- stringTok "satisfy"
-    _ <- charTok ';'
+    goal <- solveDirectiveParser
     _ <- spaces
     _ <- eof
-    pure (ADT decls cons Satisfy)
+
+    pure (ADT decls cons goal)
 
 -- Parse an identifier starting with a letter, followed by letters, digits or underscores
 identifierParser :: Parser String
@@ -233,6 +236,19 @@ declarationParser =
     constantDeclarationParser
         <|> variableDeclarationParser
 
+-- Parse satisfaction and optimization directives.
+solveDirectiveParser :: Parser SolverGoal
+solveDirectiveParser = do
+    _ <- stringTok "solve"
+
+    goal <-
+            (Satisfy <$ stringTok "satisfy")
+        <|> (Minimize <$> (stringTok "minimize" *> exprParser))
+        <|> (Maximize <$> (stringTok "maximize" *> exprParser))
+
+    _ <- charTok ';'
+    pure goal
+
 --------------------------------------------------------------------------------
 -- Solver
 --------------------------------------------------------------------------------
@@ -246,16 +262,82 @@ data ConstraintProblem = ConstraintProblem
     , searchConstraints :: [Constraint]
     }
 
+-- Find a satisfying assignment or the optimal assignment.
 solveProblem :: ADT -> Maybe [(String, Int)]
-solveProblem adt = listToMaybe (search problem)
+solveProblem adt =
+    case solverGoal adt of
+        Satisfy ->
+            listToMaybe solutions
+
+        Minimize objective ->
+            chooseOptimal (<) objective solutions constants
+
+        Maximize objective ->
+            chooseOptimal (>) objective solutions constants
   where
-    problem =
-        ConstraintProblem
-            { searchConstants = []
-            , solvedVars = []
-            , remainingDeclarations = declarations adt
-            , searchConstraints = constraints adt
-            }
+    solutions = search (initialProblem adt)
+    constants = evaluateConstants (declarations adt)
+
+-- Evaluate constants in declaration order.
+evaluateConstants :: [Declaration] -> Maybe [Binding]
+evaluateConstants = go []
+  where
+    go bindings [] = Just bindings
+
+    go bindings (ConstantDeclaration name expr : rest) = do
+        let p = ConstraintProblem
+                { searchConstants = bindings
+                , solvedVars = []
+                , remainingDeclarations = []
+                , searchConstraints = []
+                }
+
+        value <- evalExpr p expr
+        go ((name, value) : bindings) rest
+
+    go bindings (_ : rest) =
+        go bindings rest
+
+-- Select the best solution for a given objective.
+chooseOptimal
+    :: (Int -> Int -> Bool)
+    -> Expr
+    -> [[Binding]]
+    -> Maybe [Binding]
+    -> Maybe [Binding]
+chooseOptimal better objective solutions constants =
+    case constants of
+        Nothing -> Nothing
+        Just constantBindings ->
+            fmap snd (foldl selectBest Nothing scored)
+          where
+            scored =
+                [ (value, bindings)
+                | bindings <- solutions
+                , let p = ConstraintProblem
+                        { searchConstants = constantBindings
+                        , solvedVars = bindings
+                        , remainingDeclarations = []
+                        , searchConstraints = []
+                        }
+                , Just value <- [evalExpr p objective]
+                ]
+
+            selectBest Nothing candidate = Just candidate
+            selectBest (Just best@(bestValue, _))
+                       candidate@(value, _)
+                | better value bestValue = Just candidate
+                | otherwise = Just best
+
+-- Create the initial search state from a parsed model.
+initialProblem :: ADT -> ConstraintProblem
+initialProblem adt =
+    ConstraintProblem
+        { searchConstants = []
+        , solvedVars = []
+        , remainingDeclarations = declarations adt
+        , searchConstraints = constraints adt
+        }
 
 -- Collect identifiers referenced by an expression.
 exprIdentifiers :: Expr -> [Identifier]

@@ -11,12 +11,13 @@ module Assignment
     , getTime
     ) where
 
-import Control.Applicative ((<|>))
+import Control.Applicative (many, some, (<|>))
+import Data.Char (isAlpha, isAlphaNum)
 import Data.Maybe (listToMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 
 import Instances (ParseError (UnexpectedString), Parser)
-import Parser (charTok, eof, spaces, stringTok)
+import Parser (charTok, eof, int, satisfy, spaces, stringTok, tok)
 
 --------------------------------------------------------------------------------
 -- AST
@@ -60,12 +61,43 @@ data SolverGoal = Satisfy
 miniZincParser :: Parser ADT
 miniZincParser = do
     _ <- spaces
+    decls <- many variableDeclarationParser
     _ <- stringTok "solve"
     _ <- stringTok "satisfy"
     _ <- charTok ';'
     _ <- spaces
     _ <- eof
     pure (ADT [] [] Satisfy)
+
+-- Parse an identifier starting with a letter, followed by letters, digits or underscores
+identifierParser :: Parser String
+identifierParser = do
+    first <- satisfy isAlpha
+    rest <- many (satisfy isIdentifierChar)
+    _ <- spaces
+    pure (first : rest)
+  where
+    isIdentifierChar c = isAlphaNum c || c == '_'
+
+
+-- Parse an inclusive integer range.
+-- This initial version supports non-negative bounds.
+domainParser :: Parser Domain
+domainParser = do
+    lower <- tok int
+    _ <- stringTok ".."
+    upper <- tok int
+    pure (Range lower upper)
+
+-- Parse a variable declaration.
+variableDeclarationParser :: Parser Declaration
+variableDeclarationParser = do
+    _ <- stringTok "var"
+    domain <- domainParser
+    _ <- charTok ':'
+    name <- identifierParser
+    _ <- charTok ';'
+    pure (VariableDeclaration name domain)
 
 --------------------------------------------------------------------------------
 -- Solver

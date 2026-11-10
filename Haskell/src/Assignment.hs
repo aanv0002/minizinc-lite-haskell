@@ -13,7 +13,7 @@ module Assignment
 
 import Control.Applicative (many, (<|>))
 import Data.Char (isAlpha, isAlphaNum)
-import Data.Maybe (listToMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Data.List (isPrefixOf, nub)
 
@@ -59,7 +59,7 @@ data Expr
     | Div Expr Expr
     | Pow Expr Expr
     | Neg Expr
-    | NumericMacro NumericMacroName [Expr]
+    | NumericMacro NumericMacroName ExprSource
     deriving (Eq, Show)
 
 data CompareOperator
@@ -73,9 +73,9 @@ data CompareOperator
 
 data Constraint
     = Compare CompareOperator Expr Expr
-    | AllConstraints [Constraint]
-    | AnyConstraints [Constraint]
-    | AllDifferent [Expr]
+    | AllConstraints BoolSource
+    | AnyConstraints BoolSource
+    | AllDifferent ExprSource
     deriving (Eq, Show)
 
 -- The objective of a MiniZinc constraint problem.
@@ -83,6 +83,26 @@ data SolverGoal
     = Satisfy
     | Minimize Expr
     | Maximize Expr
+    deriving (Eq, Show)
+
+-- A generator iterates over an integer range or finite set.
+data GeneratorDomain
+    = GeneratorRange Expr Expr
+    | GeneratorSet [Int]
+    deriving (Eq, Show)
+
+-- Sources of numeric values for macro evaluation.
+data ExprSource
+    = ExprList [Expr]
+    | ExprArray Identifier
+    | ExprGenerator Identifier GeneratorDomain Expr
+    deriving (Eq, Show)
+
+-- Sources of boolean comparisons for all and any.
+data BoolSource
+    = BoolList [Constraint]
+    | BoolArray Identifier
+    | BoolGenerator Identifier GeneratorDomain Constraint
     deriving (Eq, Show)
 
 --------------------------------------------------------------------------------
@@ -419,7 +439,6 @@ expressionListParser =
         *> (exprParser `sepBy` commaTok)
         <* charTok ']'
 
--- Parse a numeric macro: sum, min or max.
 numericMacroParser :: Parser Expr
 numericMacroParser = do
     macro <-
@@ -428,10 +447,10 @@ numericMacroParser = do
         <|> (MacroMax <$ stringTok "max")
 
     _ <- charTok '('
-    values <- expressionListParser
+    source <- exprSourceParser
     _ <- charTok ')'
 
-    pure (NumericMacro macro values)
+    pure (NumericMacro macro source)
 
 -- Parse a comparison without the constraint keyword.
 comparisonParser :: Parser Constraint
@@ -456,19 +475,74 @@ booleanComparisonMacroParser = do
         <|> (AnyConstraints <$ stringTok "any")
 
     _ <- charTok '('
-    comparisons <- comparisonListParser
+    source <- boolSourceParser
     _ <- charTok ')'
 
-    pure (constructor comparisons)
+    pure (constructor source)
 
 -- Parse allDifferent over a list of expressions.
 allDifferentParser :: Parser Constraint
 allDifferentParser = do
     _ <- stringTok "allDifferent"
     _ <- charTok '('
-    values <- expressionListParser
+    source <- exprSourceParser
     _ <- charTok ')'
-    pure (AllDifferent values)
+
+    pure (AllDifferent source)
+
+-- Parse a generator domain such as 1..n or {1,3,5}.
+generatorDomainParser :: Parser GeneratorDomain
+generatorDomainParser =
+        (GeneratorSet <$> finiteValues)
+    <|> range
+  where
+    finiteValues =
+        charTok '{'
+            *> (signedIntParser `sepBy` commaTok)
+            <* charTok '}'
+
+    range = do
+        lower <- exprParser
+        _ <- stringTok ".."
+        upper <- exprParser
+        pure (GeneratorRange lower upper)
+
+-- Parse the literal, array, or generator form
+-- of a numeric macro argument.
+exprSourceParser :: Parser ExprSource
+exprSourceParser =
+        (ExprList <$> expressionListParser)
+    <|> exprGeneratorParser
+    <|> (ExprArray <$> identifierParser)
+
+exprGeneratorParser :: Parser ExprSource
+exprGeneratorParser = do
+    iterator <- identifierParser
+    _ <- stringTok "in"
+    domain <- generatorDomainParser
+    _ <- charTok ')'
+    _ <- charTok '('
+    body <- exprParser
+
+    pure (ExprGenerator iterator domain body)
+
+-- Parse the three forms of boolean macro arguments.
+boolSourceParser :: Parser BoolSource
+boolSourceParser =
+        (BoolList <$> comparisonListParser)
+    <|> boolGeneratorParser
+    <|> (BoolArray <$> identifierParser)
+
+boolGeneratorParser :: Parser BoolSource
+boolGeneratorParser = do
+    iterator <- identifierParser
+    _ <- stringTok "in"
+    domain <- generatorDomainParser
+    _ <- charTok ')'
+    _ <- charTok '('
+    body <- comparisonParser
+
+    pure (BoolGenerator iterator domain body)
 
 --------------------------------------------------------------------------------
 -- Solver
@@ -560,6 +634,111 @@ initialProblem adt =
         , searchConstraints = constraints adt
         }
 
+-- | Evaluate the integer values in a generator domain.
+evalGeneratorDomain
+    :: ConstraintProblem -> GeneratorDomain -> Maybe [Int]
+evalGeneratorDomain _ (GeneratorSet values)
+    | length values == length (nub values) =
+        Just values
+    | otherwise = Nothing
+
+evalGeneratorDomain p (GeneratorRange lower upper) = do
+    lo <- evalExpr p lower
+    hi <- evalExpr p upper
+
+    if lo <= hi
+        then Just [lo..hi]
+        else Nothing
+
+-- | Evaluate an expression with a local generator binding.
+withIterator
+    :: ConstraintProblem -> Identifier -> Int -> ConstraintProblem
+withIterator p name value =
+    p { searchConstants =
+            (name, value) : searchConstants p
+      }
+
+-- | Construct indexed expressions for assigned array elements.
+-- These are evaluated only when the required values are ready.
+arrayExpressions
+    :: ConstraintProblem -> Identifier -> Maybe [Expr]
+arrayExpressions p name =
+    if count == 0
+        then Nothing
+        else Just
+            [ ArrayAt name (IntLit index)
+            | index <- [1..count]
+            ]
+  where
+    prefix = name ++ "["
+
+    count = length
+        (filter (isPrefixOf prefix . fst) (solvedVars p))
+
+-- | Evaluate all numeric values produced by a macro source.
+evalExprSource
+    :: ConstraintProblem -> ExprSource -> Maybe [Int]
+evalExprSource p (ExprList expressions) =
+    traverse (evalExpr p) expressions
+
+evalExprSource p (ExprArray name) = do
+    expressions <- arrayExpressions p name
+    traverse (evalExpr p) expressions
+
+evalExprSource p (ExprGenerator name domain body) = do
+    indices <- evalGeneratorDomain p domain
+
+    traverse
+        (\index -> evalExpr (withIterator p name index) body)
+        indices
+
+-- Evaluate comparisons from a boolean macro source.
+evalBoolSource
+    :: ConstraintProblem -> BoolSource -> Maybe [Bool]
+evalBoolSource p (BoolList comparisons) =
+    traverse (evalConstraint p) comparisons
+
+evalBoolSource p (BoolArray name) = do
+    expressions <- arrayExpressions p name
+    values <- traverse (evalExpr p) expressions
+    pure (map (/= 0) values)
+
+evalBoolSource p (BoolGenerator name domain body) = do
+    indices <- evalGeneratorDomain p domain
+
+    traverse
+        (\index ->
+            evalConstraint (withIterator p name index) body)
+        indices
+
+-- Identifiers referenced by generator bounds.
+generatorDomainIdentifiers :: GeneratorDomain -> [Identifier]
+generatorDomainIdentifiers (GeneratorSet _) = []
+generatorDomainIdentifiers (GeneratorRange a b) =
+    exprIdentifiers a ++ exprIdentifiers b
+
+-- Identifiers referenced by a numeric macro source.
+exprSourceIdentifiers :: ExprSource -> [Identifier]
+exprSourceIdentifiers (ExprList expressions) =
+    concatMap exprIdentifiers expressions
+
+exprSourceIdentifiers (ExprArray name) = [name]
+
+exprSourceIdentifiers (ExprGenerator name domain body) =
+    generatorDomainIdentifiers domain
+        ++ filter (/= name) (exprIdentifiers body)
+
+-- Identifiers referenced by a boolean macro source.
+boolSourceIdentifiers :: BoolSource -> [Identifier]
+boolSourceIdentifiers (BoolList comparisons) =
+    concatMap constraintIdentifiers comparisons
+
+boolSourceIdentifiers (BoolArray name) = [name]
+
+boolSourceIdentifiers (BoolGenerator name domain body) =
+    generatorDomainIdentifiers domain
+        ++ filter (/= name) (constraintIdentifiers body)
+
 -- Collect identifiers referenced by an expression.
 exprIdentifiers :: Expr -> [Identifier]
 exprIdentifiers (IntLit _) = []
@@ -570,8 +749,8 @@ exprIdentifiers (Sub a b) = binaryIdentifiers a b
 exprIdentifiers (Mul a b) = binaryIdentifiers a b
 exprIdentifiers (Div a b) = binaryIdentifiers a b
 exprIdentifiers (Pow a b) = binaryIdentifiers a b
-exprIdentifiers (NumericMacro _ values) =
-    concatMap exprIdentifiers values
+exprIdentifiers (NumericMacro _ source) =
+    exprSourceIdentifiers source
 exprIdentifiers (ArrayAt name indexExpr) =
     name : exprIdentifiers indexExpr
 
@@ -585,14 +764,14 @@ constraintIdentifiers :: Constraint -> [Identifier]
 constraintIdentifiers (Compare _ a b) =
     exprIdentifiers a ++ exprIdentifiers b
 
-constraintIdentifiers (AllConstraints comparisons) =
-    concatMap constraintIdentifiers comparisons
+constraintIdentifiers (AllConstraints source) =
+    boolSourceIdentifiers source
 
-constraintIdentifiers (AnyConstraints comparisons) =
-    concatMap constraintIdentifiers comparisons
+constraintIdentifiers (AnyConstraints source) =
+    boolSourceIdentifiers source
 
-constraintIdentifiers (AllDifferent expressions) =
-    concatMap exprIdentifiers expressions
+constraintIdentifiers (AllDifferent source) =
+    exprSourceIdentifiers source
 
 -- Extract identifiers from an optimization objective.
 goalIdentifiers :: SolverGoal -> [Identifier]
@@ -655,12 +834,47 @@ constraintReady p c =
             ConstantDeclaration _ _ ->
                 False
 
--- Reject constraints that are already known to be false.
--- Constraints with missing variables are checked later.
+-- Evaluate whichever values of a macro source are currently available during backtracking.
+availableValues :: ConstraintProblem -> ExprSource -> [Int]
+availableValues p (ExprList expressions) =
+    mapMaybe (evalExpr p) expressions
+
+availableValues p (ExprArray name) =
+    [ value
+    | (identifier, value) <- solvedVars p
+    , isPrefixOf (name ++ "[") identifier
+    ]
+
+availableValues p (ExprGenerator name domain body) =
+    case evalGeneratorDomain p domain of
+        Nothing -> []
+        Just indices ->
+            mapMaybe
+                (\index ->
+                    evalExpr (withIterator p name index) body)
+                indices
+
+-- Reject repeated known values before the full array or generator has been evaluated.
+partialAllDifferent :: ConstraintProblem -> ExprSource -> Bool
+partialAllDifferent p source =
+    let values = availableValues p source
+    in length values == length (nub values)
+
+-- Check every constraint that can be evaluated.
+-- Additionally prune partial allDifferent conflicts.
 consistent :: ConstraintProblem -> Bool
 consistent p = all valid (searchConstraints p)
   where
-    valid c
+    valid c =
+        case c of
+            AllDifferent source ->
+                partialAllDifferent p source
+                    && checkWhenReady c
+
+            _ ->
+                checkWhenReady c
+
+    checkWhenReady c
         | constraintReady p c =
             evalConstraint p c == Just True
         | otherwise = True
@@ -754,14 +968,18 @@ evalExpr p (Pow a b) = do
 evalExpr p (Neg a) =
     negate <$> evalExpr p a
 
-evalExpr p (NumericMacro macro values) = do
-    numbers <- traverse (evalExpr p) values
+evalExpr p (NumericMacro macro source) = do
+    numbers <- evalExprSource p source
+
     case macro of
-        MacroSum -> Just (sum numbers)
+        MacroSum ->
+            Just (sum numbers)
+
         MacroMin ->
             if null numbers
                 then Nothing
                 else Just (minimum numbers)
+
         MacroMax ->
             if null numbers
                 then Nothing
@@ -778,14 +996,14 @@ evalExpr p (ArrayAt name indexExpr) = do
 evalConstraint :: ConstraintProblem -> Constraint -> Maybe Bool
 evalConstraint p (Compare op a b) = applyCompare op <$> evalExpr p a <*> evalExpr p b
 
-evalConstraint p (AllConstraints comparisons) =
-    all id <$> traverse (evalConstraint p) comparisons
+evalConstraint p (AllConstraints source) =
+    all id <$> evalBoolSource p source
 
-evalConstraint p (AnyConstraints comparisons) =
-    any id <$> traverse (evalConstraint p) comparisons
+evalConstraint p (AnyConstraints source) =
+    any id <$> evalBoolSource p source
 
-evalConstraint p (AllDifferent expressions) = do
-    values <- traverse (evalExpr p) expressions
+evalConstraint p (AllDifferent source) = do
+    values <- evalExprSource p source
     pure (length values == length (nub values))
 
 -- Evaluate a comparison between two integer values.

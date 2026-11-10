@@ -2,13 +2,14 @@
 
 import Assignment
 import Control.Exception (IOException, try)
-import Control.Monad (forM)
+import Control.Monad (forM, unless)
 import Data.Char (isSpace)
 import Data.List (sortOn)
 import Data.Maybe (mapMaybe)
 
 import Instances (ParseResult (Error, Result), parse)
 import System.Directory (createDirectoryIfMissing)
+import System.Exit (exitFailure)
 import System.FilePath
     ( joinPath
     , replaceExtension
@@ -137,6 +138,154 @@ checkInput inputFile = do
             ++ (if ok then "PASS" else "FAIL")
     pure ok
 
+-- | Check that a valid model produces an expected solution.
+checkSolution
+    :: String
+    -> String
+    -> (Solution -> Bool)
+    -> IO Bool
+checkSolution testName source expected = do
+    let result =
+            case parse miniZincParser source of
+                Error _ -> Nothing
+                Result _ ast -> Just (solveProblem ast)
+
+    let passed =
+            case result of
+                Nothing -> False
+                Just solution -> expected solution
+
+    putStrLn $
+        (if passed then "PASS: " else "FAIL: ")
+            ++ testName
+
+    pure passed
+
+-- Check that invalid MiniZinc input is rejected.
+checkInvalid :: String -> String -> IO Bool
+checkInvalid testName source = do
+    let passed =
+            case parse miniZincParser source of
+                Error _ -> True
+                Result _ _ -> False
+
+    putStrLn $
+        (if passed then "PASS: " else "FAIL: ")
+            ++ testName
+
+    pure passed
+
+-- Regression tests covering the main language features.
+runRegressionTests :: IO Bool
+runRegressionTests = do
+    results <- sequence
+        [ checkSolution
+            "Signed integer range"
+            "var -3..3: x; constraint x = -2; solve satisfy;"
+            (== Just [("x", -2)])
+
+        , checkSolution
+            "Finite-set domain"
+            "var {1,3,5}: x; constraint x > 3; solve satisfy;"
+            (== Just [("x", 5)])
+
+        , checkSolution
+            "Constant-based domain"
+            "int: n = 3; var 1..n: x; solve maximize x;"
+            (== Just [("x", 3)])
+
+        , checkSolution
+            "Arithmetic precedence"
+            "var 1..20: x; constraint x = 2 + 3 * 4; solve satisfy;"
+            (== Just [("x", 14)])
+
+        , checkSolution
+            "Right-associative exponentiation"
+            "var 1..600: x; constraint x = 2^3^2; solve satisfy;"
+            (== Just [("x", 512)])
+
+        , checkSolution
+            "Numeric sum macro"
+            "var 1..5: x; constraint sum([x,2,3]) = 7; solve satisfy;"
+            (== Just [("x", 2)])
+
+        , checkSolution
+            "Boolean all macro"
+            "var 1..5: x; constraint all([x>2,x<4]); solve satisfy;"
+            (== Just [("x", 3)])
+
+        , checkSolution
+            "Optimization"
+            "var 1..5: x; constraint x <= 4; solve maximize x;"
+            (== Just [("x", 4)])
+
+        , checkSolution
+            "Unsatisfiable model"
+            "var 1..3: x; constraint x > 10; solve satisfy;"
+            (== Nothing)
+
+        , checkInvalid
+            "Duplicate identifier"
+            "var 1..3: x; var 1..5: x; solve satisfy;"
+
+        , checkInvalid
+            "Undefined identifier"
+            "var 1..3: x; constraint x = y; solve satisfy;"
+
+        , checkInvalid
+            "Invalid domain"
+            "var 5..1: x; solve satisfy;"
+                , checkSolution
+            "Array indexing"
+            ( "array[1..2] of var 1..3: q; "
+                ++ "constraint q[1] = 2; "
+                ++ "constraint q[2] = 3; "
+                ++ "solve satisfy;"
+            )
+            (== Just [("q[1]", 2), ("q[2]", 3)])
+
+        , checkSolution
+            "Array allDifferent"
+            ( "array[1..2] of var 1..2: q; "
+                ++ "constraint allDifferent(q); "
+                ++ "solve satisfy;"
+            )
+            (== Just [("q[1]", 1), ("q[2]", 2)])
+
+        , checkSolution
+            "Generator sum"
+            ( "constraint sum(i in 1..3)(i*2) = 12; "
+                ++ "solve satisfy;"
+            )
+            (== Just [])
+
+        , checkSolution
+            "Four Queens"
+            ( "int: n = 4; "
+                ++ "array[1..n] of var 1..n: q; "
+                ++ "constraint allDifferent(q); "
+                ++ "constraint allDifferent(i in 1..n)(q[i]+i); "
+                ++ "constraint allDifferent(i in 1..n)(q[i]-i); "
+                ++ "solve satisfy;"
+            )
+            (\solution ->
+                normalise solution `elem`
+                    [ Just
+                        [ ("q[1]", 2)
+                        , ("q[2]", 4)
+                        , ("q[3]", 1)
+                        , ("q[4]", 3)
+                        ]
+                    , Just
+                        [ ("q[1]", 3)
+                        , ("q[2]", 1)
+                        , ("q[3]", 4)
+                        , ("q[4]", 2)
+                        ]
+                    ])]
+
+    pure (and results)
+
 main :: IO ()
 main = do
     putStrLn "Testing "
@@ -160,4 +309,10 @@ main = do
             ++ show (length results)
             ++ " example input(s)."
 
+    putStrLn "\nRunning additional regression tests:"
+    
+    regressionPassed <- runRegressionTests
+
     putStrLn "\nAll processing complete."
+
+    unless (and results && regressionPassed) exitFailure

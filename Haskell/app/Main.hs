@@ -5,6 +5,11 @@
 -- model, parses and solves it, and returns the resulting assignment.
 module Main (main) where
 
+{- |
+AI Assistance: ChatGPT
+Assisted with the Save API, solution formatting, and file generation.
+-}
+
 import Assignment (getTime, miniZincParser, solveProblem)
 import Control.Arrow (second)
 import Control.Concurrent.QSemN (newQSemN)

@@ -11,6 +11,12 @@ module Assignment
     , getTime
     ) where
 
+{- |
+AI Assistance: ChatGPT
+Assisted with AST design, parsing, constraint solving,
+backtracking, arrays, generators, and debugging.
+-}
+
 import Control.Applicative (many, (<|>))
 import Data.Char (isAlpha, isAlphaNum)
 import Data.Maybe (listToMaybe, mapMaybe)
